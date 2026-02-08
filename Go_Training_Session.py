@@ -57,6 +57,8 @@ PLAY_PHASE_IN_GAME = "in_game"
 PLAY_PHASE_OFFER_REVIEW = "offer_review"
 PLAY_PHASE_TIME_UP = "time_up"
 
+LAST_NAVIGATION = {"url": None, "time": 0.0}
+
 
 # ================================
 # Chrome Setup
@@ -113,7 +115,7 @@ def launch_chrome(first_url):
         first_url,
         f"--remote-debugging-port={DEBUG_PORT}",
         f"--user-data-dir={CHROME_PROFILE_PATH}",
-        "--start-fullscreen",
+        "--kiosk",
         "--disable-notifications",
         "--no-first-run",
         "--disable-infobars"
@@ -159,6 +161,7 @@ def inject_overlay(
     countdown_seconds=None,
     time_suffix="",
 ):
+    wait_for_dom_ready(driver)
 
     button_html = (
         "<button id='goBtn' style='margin-top:12px;font-size:16px;padding:6px 14px;border-radius:8px;'>NEXT</button>"
@@ -257,14 +260,42 @@ def inject_overlay(
 # Helpers
 # ================================
 
+def wait_for_dom_ready(driver, timeout=8):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            ready_state = driver.execute_script("return document.readyState")
+            has_body = driver.execute_script("return !!document.body")
+        except (WebDriverException, JavascriptException):
+            time.sleep(0.2)
+            continue
+        if ready_state in {"interactive", "complete"} and has_body:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def safe_get(driver, url, min_interval=2.0):
+    now = time.time()
+    if driver.current_url.startswith(url):
+        return False
+    last_url = LAST_NAVIGATION["url"]
+    if last_url == url and now - LAST_NAVIGATION["time"] < min_interval:
+        return False
+    driver.get(url)
+    LAST_NAVIGATION["url"] = url
+    LAST_NAVIGATION["time"] = now
+    return True
+
+
 def enforce_domain(driver, allowed_domain):
     if allowed_domain not in driver.current_url:
-        driver.get(f"https://{allowed_domain}")
+        safe_get(driver, f"https://{allowed_domain}")
 
 
 def ensure_url(driver, expected_url):
     if not driver.current_url.startswith(expected_url):
-        driver.get(expected_url)
+        safe_get(driver, expected_url)
 
 
 def element_exists(driver, by, value):
@@ -352,7 +383,8 @@ def tsumego_problem_complete(driver):
 
 
 def requires_login(driver, check_url, login_fragment):
-    driver.get(check_url)
+    safe_get(driver, check_url)
+    wait_for_dom_ready(driver)
     time.sleep(1)
     return login_fragment in driver.current_url
 
@@ -360,7 +392,7 @@ def requires_login(driver, check_url, login_fragment):
 def wait_for_account_setup(driver, check_url, login_url, login_fragment, subtitle):
     if not requires_login(driver, check_url, login_fragment):
         return
-    driver.get(login_url)
+    safe_get(driver, login_url)
     while True:
         inject_overlay(driver, "Account Setup", subtitle)
         if login_fragment not in driver.current_url:
