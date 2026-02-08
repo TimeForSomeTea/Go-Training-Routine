@@ -12,7 +12,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, WebDriverException, JavascriptException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -29,6 +29,30 @@ KATRAIN_BASE = "https://sir-teo.github.io/web-katrain/"
 TSUMEGO_MIN = 15
 PLAY_MIN = 45
 REVIEW_MIN = 10
+
+OVERLAY_COPY = {
+    "tsumego_complete_title": "Tsumego complete!",
+    "tsumego_complete_subtitle": "Moving to play block",
+    "tsumego_finish_title": "Finish the current problem",
+    "tsumego_finish_subtitle": "Auto-advancing when complete",
+    "tsumego_focus_title": "Tsumego Focus",
+    "play_title": "Play on OGS",
+    "play_waiting_title": "Waiting for game to finish...",
+    "game_finished_title": "Game finished",
+    "game_finished_auto_title": "Game finished!",
+    "game_finished_auto_subtitle": "Auto-advancing to AI review",
+    "game_finished_subtitle": "Click NEXT for review or keep playing",
+    "play_complete_title": "Play block complete!",
+    "play_complete_subtitle": "Click NEXT to review",
+    "review_title": "AI Review",
+    "review_complete_title": "Review complete!",
+    "review_complete_subtitle": "Click NEXT to play again",
+}
+
+PLAY_PHASE_SEARCHING = "searching"
+PLAY_PHASE_IN_GAME = "in_game"
+PLAY_PHASE_OFFER_REVIEW = "offer_review"
+PLAY_PHASE_TIME_UP = "time_up"
 
 
 # ================================
@@ -62,7 +86,10 @@ def find_chrome():
         if os.path.exists(path):
             return path
 
-    raise RuntimeError("Chrome not found.")
+    raise RuntimeError(
+        "Chrome not found. Install Google Chrome or Chromium, or set CHROME_PATH to the "
+        "executable path (for example, CHROME_PATH=/usr/bin/google-chrome)."
+    )
 
 
 def is_port_open(port):
@@ -176,8 +203,10 @@ def inject_overlay(driver, title, subtitle="", show_button=False, show_exit=Fals
 
     try:
         driver.execute_script(script)
-    except:
-        sys.exit(0)
+        return True
+    except (WebDriverException, JavascriptException) as exc:
+        print(f"Overlay injection failed: {exc}", file=sys.stderr)
+        return False
 
 
 # ================================
@@ -300,21 +329,21 @@ def tsumego_block(driver):
             if tsumego_problem_complete(driver):
                 inject_overlay(
                     driver,
-                    "Tsumego complete!",
-                    "Moving to play block",
+                    OVERLAY_COPY["tsumego_complete_title"],
+                    OVERLAY_COPY["tsumego_complete_subtitle"],
                 )
                 time.sleep(2)
                 return
 
             inject_overlay(
                 driver,
-                "Finish the current problem",
-                "Auto-advancing when complete",
+                OVERLAY_COPY["tsumego_finish_title"],
+                OVERLAY_COPY["tsumego_finish_subtitle"],
             )
         else:
             mins = remaining // 60
             secs = remaining % 60
-            inject_overlay(driver, "Tsumego Focus", f"{mins}:{secs:02d}")
+            inject_overlay(driver, OVERLAY_COPY["tsumego_focus_title"], f"{mins}:{secs:02d}")
 
         ensure_url(driver, TSUMEGO_URL)
 
@@ -332,30 +361,31 @@ def play_block(driver, extra_practice=False):
     end = time.time() + PLAY_MIN * 60
 
     current_game = None
-    was_in_game = False
     cached_game_data = None
     cached_outcome = None
-    pending_review_offer = False
+    phase = PLAY_PHASE_SEARCHING
 
     while True:
 
         remaining = int(end - time.time())
 
-        if pending_review_offer and driver.execute_script("return window.goNext === true;"):
+        if phase in {PLAY_PHASE_OFFER_REVIEW, PLAY_PHASE_TIME_UP} and driver.execute_script(
+            "return window.goNext === true;"
+        ):
             return current_game, cached_game_data
 
         gid = get_game_id(driver.current_url)
         if gid:
             current_game = gid
 
-        # detect entry into a real live game
-        if in_active_game(driver):
-            was_in_game = True
-            if pending_review_offer:
-                pending_review_offer = False
+        in_game = in_active_game(driver)
+        if in_game:
+            phase = PLAY_PHASE_IN_GAME
+        elif phase == PLAY_PHASE_IN_GAME and not game_finished(driver):
+            phase = PLAY_PHASE_SEARCHING
 
         # ⭐ EARLY EXIT WHEN GAME ENDS WITH RESIGN/PASS
-        if was_in_game and game_finished(driver):
+        if phase == PLAY_PHASE_IN_GAME and game_finished(driver):
             if current_game and not cached_game_data:
                 cached_game_data = fetch_game_data(current_game)
                 cached_outcome = game_outcome_text(cached_game_data)
@@ -363,49 +393,40 @@ def play_block(driver, extra_practice=False):
             if reviewable_outcome(cached_outcome) and not in_active_game(driver):
                 inject_overlay(
                     driver,
-                    "Game finished!",
-                    "Auto-advancing to AI review",
+                    OVERLAY_COPY["game_finished_auto_title"],
+                    OVERLAY_COPY["game_finished_auto_subtitle"],
                 )
                 time.sleep(2)
                 return current_game, cached_game_data
-
-            if not pending_review_offer:
-                inject_overlay(
-                    driver,
-                    "Game finished",
-                    "Click NEXT for review or keep playing",
-                    True
-                )
-                pending_review_offer = True
+            phase = PLAY_PHASE_OFFER_REVIEW
 
         # timer expired — but never interrupt a game
-        if remaining <= 0 and not in_active_game(driver):
+        if remaining <= 0 and not in_active_game(driver) and phase != PLAY_PHASE_OFFER_REVIEW:
+            phase = PLAY_PHASE_TIME_UP
 
+        if phase == PLAY_PHASE_OFFER_REVIEW:
             inject_overlay(
                 driver,
-                "Play block complete!",
-                "Click NEXT to review",
-                True
+                OVERLAY_COPY["game_finished_title"],
+                OVERLAY_COPY["game_finished_subtitle"],
+                True,
             )
-
-            while True:
-                if driver.execute_script("return window.goNext === true;"):
-                    return current_game, cached_game_data
-                time.sleep(1)
-
-        if pending_review_offer:
-            time.sleep(1)
-            continue
-
-        if remaining > 0:
+        elif phase == PLAY_PHASE_TIME_UP:
+            inject_overlay(
+                driver,
+                OVERLAY_COPY["play_complete_title"],
+                OVERLAY_COPY["play_complete_subtitle"],
+                True,
+            )
+        elif remaining > 0:
             mins = remaining // 60
             secs = remaining % 60
             subtitle = f"{mins}:{secs:02d}"
             if extra_practice:
                 subtitle += " <span style='color:#8fb3ff;'>(extra practice)</span>"
-            inject_overlay(driver, "Play on OGS", subtitle)
+            inject_overlay(driver, OVERLAY_COPY["play_title"], subtitle)
         else:
-            inject_overlay(driver, "Waiting for game to finish...")
+            inject_overlay(driver, OVERLAY_COPY["play_waiting_title"])
 
         enforce_domain(driver, "online-go.com")
 
@@ -441,10 +462,10 @@ def review_block(driver, game_id, game_data=None):
 
             inject_overlay(
                 driver,
-                "Review complete!",
-                "Click NEXT to play again",
+                OVERLAY_COPY["review_complete_title"],
+                OVERLAY_COPY["review_complete_subtitle"],
                 True,
-                True
+                True,
             )
 
             while True:
@@ -457,7 +478,7 @@ def review_block(driver, game_id, game_data=None):
         mins = remaining // 60
         secs = remaining % 60
 
-        inject_overlay(driver, "AI Review", f"{mins}:{secs:02d}")
+        inject_overlay(driver, OVERLAY_COPY["review_title"], f"{mins}:{secs:02d}")
 
         time.sleep(5)
 
