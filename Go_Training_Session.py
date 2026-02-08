@@ -498,13 +498,27 @@ def play_block(driver, extra_practice=False):
         if gid:
             current_game = gid
 
-        in_game = in_active_game(driver)
+        finished_game = game_finished(driver)
+        in_game = "online-go.com/game/" in driver.current_url and not finished_game
         if in_game:
             phase = PLAY_PHASE_IN_GAME
-        elif phase == PLAY_PHASE_IN_GAME and not game_finished(driver):
+        elif phase == PLAY_PHASE_IN_GAME and not finished_game:
             phase = PLAY_PHASE_SEARCHING
 
-        if current_game and not in_active_game(driver):
+        if finished_game and current_game and not in_game:
+            if not cached_game_data:
+                cached_game_data = fetch_game_data(current_game)
+                cached_outcome = game_outcome_text(cached_game_data)
+            if reviewable_outcome(cached_outcome):
+                inject_overlay(
+                    driver,
+                    OVERLAY_COPY["game_finished_auto_title"],
+                    OVERLAY_COPY["game_finished_auto_subtitle"],
+                )
+                time.sleep(2)
+                return current_game, cached_game_data
+            phase = PLAY_PHASE_OFFER_REVIEW
+        elif current_game and not in_active_game(driver):
             if not cached_game_data:
                 cached_game_data = fetch_game_data(current_game)
                 cached_outcome = game_outcome_text(cached_game_data)
@@ -512,7 +526,7 @@ def play_block(driver, extra_practice=False):
                 phase = PLAY_PHASE_OFFER_REVIEW
 
         # ⭐ EARLY EXIT WHEN GAME ENDS WITH RESIGN/PASS
-        if phase == PLAY_PHASE_IN_GAME and game_finished(driver):
+        if phase == PLAY_PHASE_IN_GAME and finished_game:
             if current_game and not cached_game_data:
                 cached_game_data = fetch_game_data(current_game)
                 cached_outcome = game_outcome_text(cached_game_data)
