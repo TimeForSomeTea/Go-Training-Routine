@@ -227,7 +227,7 @@ def inject_overlay(
             }};
             const tick = () => {{
                 const remainingMs = Math.max(0, endTime - Date.now());
-                const remainingSeconds = remainingMs / 1000;
+                const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
                 if (timerEl) {{
                     timerEl.innerHTML = `${{formatTime(remainingSeconds)}}${{timeSuffix}}`;
                 }}
@@ -237,7 +237,7 @@ def inject_overlay(
                 }}
             }};
             tick();
-            window.goTimerInterval = setInterval(tick, 100);
+            window.goTimerInterval = setInterval(tick, 250);
         }}
 
         let btn = document.getElementById('goBtn');
@@ -372,6 +372,14 @@ def reviewable_outcome(outcome_text):
     return False
 
 
+def game_has_ended(game_data):
+    if not game_data:
+        return False
+    if game_data.get("ended") or game_data.get("end_time"):
+        return True
+    return bool(game_outcome_text(game_data))
+
+
 def tsumego_problem_complete(driver):
     completion_checks = [
         (By.XPATH, "//*[contains(., '下一题') or contains(., '下一道') or contains(., '再来') or contains(., '继续') or contains(., 'Next')]"),
@@ -396,6 +404,20 @@ def wait_for_account_setup(driver, check_url, login_url, login_fragment, subtitl
     while True:
         inject_overlay(driver, "Account Setup", subtitle)
         if login_fragment not in driver.current_url:
+            return
+        time.sleep(3)
+
+
+def wait_for_ogs_login(driver):
+    safe_get(driver, OGS_LOGIN_URL)
+    while True:
+        wait_for_dom_ready(driver)
+        inject_overlay(driver, "Account Setup", "Sign in to OGS to continue")
+        if "sign-in" not in driver.current_url and not element_exists(
+            driver,
+            By.XPATH,
+            "//input[@type='password']",
+        ):
             return
         time.sleep(3)
 
@@ -481,6 +503,13 @@ def play_block(driver, extra_practice=False):
             phase = PLAY_PHASE_IN_GAME
         elif phase == PLAY_PHASE_IN_GAME and not game_finished(driver):
             phase = PLAY_PHASE_SEARCHING
+
+        if current_game and not in_active_game(driver):
+            if not cached_game_data:
+                cached_game_data = fetch_game_data(current_game)
+                cached_outcome = game_outcome_text(cached_game_data)
+            if game_has_ended(cached_game_data) and phase not in {PLAY_PHASE_OFFER_REVIEW, PLAY_PHASE_TIME_UP}:
+                phase = PLAY_PHASE_OFFER_REVIEW
 
         # ⭐ EARLY EXIT WHEN GAME ENDS WITH RESIGN/PASS
         if phase == PLAY_PHASE_IN_GAME and game_finished(driver):
@@ -609,13 +638,7 @@ def run():
         "Sign in to 101weiqi to continue",
     )
 
-    wait_for_account_setup(
-        driver,
-        OGS_URL,
-        OGS_LOGIN_URL,
-        "sign-in",
-        "Sign in to OGS to continue",
-    )
+    wait_for_ogs_login(driver)
 
     while True:
 
