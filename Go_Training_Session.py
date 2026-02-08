@@ -6,6 +6,9 @@ import socket
 import sys
 import json
 import urllib.request
+import sqlite3
+import tempfile
+import shutil
 from datetime import datetime
 
 from selenium import webdriver
@@ -26,17 +29,20 @@ TSUMEGO_URL = "https://www.101weiqi.com/task/do/"
 OGS_URL = "https://online-go.com/play"
 KATRAIN_BASE = "https://sir-teo.github.io/web-katrain/"
 
+TSUMEGO_LOGIN_URL = "https://www.101weiqi.com/login"
+OGS_LOGIN_URL = "https://online-go.com/sign-in#/play"
+
 TSUMEGO_MIN = 15
 PLAY_MIN = 45
 REVIEW_MIN = 10
 
 OVERLAY_COPY = {
-    "tsumego_complete_title": "Tsumego complete!",
+    "tsumego_complete_title": "Study complete!",
     "tsumego_complete_subtitle": "Moving to play block",
     "tsumego_finish_title": "Finish the current problem",
     "tsumego_finish_subtitle": "Auto-advancing when complete",
-    "tsumego_focus_title": "Tsumego Focus",
-    "play_title": "Play on OGS",
+    "tsumego_focus_title": "Study",
+    "play_title": "Play",
     "play_waiting_title": "Waiting for game to finish...",
     "game_finished_title": "Game finished",
     "game_finished_auto_title": "Game finished!",
@@ -44,7 +50,7 @@ OVERLAY_COPY = {
     "game_finished_subtitle": "Click NEXT for review or keep playing",
     "play_complete_title": "Play block complete!",
     "play_complete_subtitle": "Click NEXT to review",
-    "review_title": "AI Review",
+    "review_title": "Review",
     "review_complete_title": "Review complete!",
     "review_complete_subtitle": "Click NEXT to play again",
 }
@@ -147,7 +153,15 @@ def get_driver():
 # Overlay
 # ================================
 
-def inject_overlay(driver, title, subtitle="", show_button=False, show_exit=False):
+def inject_overlay(
+    driver,
+    title,
+    subtitle="",
+    show_button=False,
+    show_exit=False,
+    countdown_seconds=None,
+    time_suffix="",
+):
 
     button_html = (
         "<button id='goBtn' style='margin-top:12px;font-size:16px;padding:6px 14px;border-radius:8px;'>NEXT</button>"
@@ -173,7 +187,7 @@ def inject_overlay(driver, title, subtitle="", show_button=False, show_exit=Fals
             top:20px;
             right:20px;
             z-index:999999;
-            background:rgba(0,0,0,0.9);
+            background:rgba(0,0,0,0.7);
             color:white;
             padding:20px;
             border-radius:14px;
@@ -182,16 +196,49 @@ def inject_overlay(driver, title, subtitle="", show_button=False, show_exit=Fals
             font-size:18px;
         `;
 
-        div.innerHTML =
-            "<div style='font-size:22px;font-weight:bold;'>{title}</div>" +
-            "<div style='font-size:14px;color:#bbb;margin-top:6px;'>{subtitle}</div>" +
-            "{button_html}" +
-            "{exit_html}";
+        const titleHtml = "<div style='font-size:16px;font-weight:600;opacity:0.9;'>{title}</div>";
+        const subtitleHtml = "<div style='font-size:14px;color:#bbb;margin-top:6px;'>{subtitle}</div>";
+        const timerHtml = "<div id='goTimer' style='font-size:36px;font-weight:700;margin-top:8px;'>{subtitle}</div>";
+        const bodyHtml = { "true" if countdown_seconds is not None else "false" }
+            ? titleHtml + timerHtml
+            : titleHtml + subtitleHtml;
+
+        div.innerHTML = bodyHtml + "{button_html}" + "{exit_html}";
 
         document.body.appendChild(div);
 
         window.goNext = false;
         window.goExit = false;
+
+        if (window.goTimerInterval) {{
+            clearInterval(window.goTimerInterval);
+            window.goTimerInterval = null;
+        }}
+
+        const countdownSeconds = {countdown_seconds if countdown_seconds is not None else "null"};
+        const timeSuffix = `{time_suffix}`;
+        if (countdownSeconds !== null) {{
+            const timerEl = document.getElementById('goTimer');
+            const endTime = Date.now() + Math.max(0, countdownSeconds) * 1000;
+            const formatTime = (totalSeconds) => {{
+                const mins = Math.floor(totalSeconds / 60);
+                const secs = Math.floor(totalSeconds % 60);
+                return `${{mins}}:${{secs.toString().padStart(2, '0')}}`;
+            }};
+            const tick = () => {{
+                const remainingMs = Math.max(0, endTime - Date.now());
+                const remainingSeconds = remainingMs / 1000;
+                if (timerEl) {{
+                    timerEl.innerHTML = `${{formatTime(remainingSeconds)}}${{timeSuffix}}`;
+                }}
+                if (remainingMs <= 0 && window.goTimerInterval) {{
+                    clearInterval(window.goTimerInterval);
+                    window.goTimerInterval = null;
+                }}
+            }};
+            tick();
+            window.goTimerInterval = setInterval(tick, 100);
+        }}
 
         let btn = document.getElementById('goBtn');
         if(btn) btn.onclick = () => window.goNext = true;
@@ -307,6 +354,42 @@ def tsumego_problem_complete(driver):
     return any(element_exists(driver, by, value) for by, value in completion_checks)
 
 
+def get_cookies_path():
+    return os.path.join(CHROME_PROFILE_PATH, "Default", "Cookies")
+
+
+def has_domain_cookie(domain):
+    cookies_path = get_cookies_path()
+    if not os.path.exists(cookies_path):
+        return False
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_path = temp_file.name
+        shutil.copy2(cookies_path, temp_path)
+        with sqlite3.connect(temp_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM cookies WHERE host_key LIKE ? LIMIT 1",
+                (f"%{domain}%",),
+            )
+            return cursor.fetchone() is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def wait_for_account_setup(driver, login_url, domain, subtitle):
+    driver.get(login_url)
+    while True:
+        inject_overlay(driver, "Account Setup", subtitle)
+        if has_domain_cookie(domain):
+            return
+        time.sleep(3)
+
+
 # ================================
 # TSUMEGO BLOCK
 # ================================
@@ -343,7 +426,12 @@ def tsumego_block(driver):
         else:
             mins = remaining // 60
             secs = remaining % 60
-            inject_overlay(driver, OVERLAY_COPY["tsumego_focus_title"], f"{mins}:{secs:02d}")
+            inject_overlay(
+                driver,
+                OVERLAY_COPY["tsumego_focus_title"],
+                f"{mins}:{secs:02d}",
+                countdown_seconds=remaining,
+            )
 
         ensure_url(driver, TSUMEGO_URL)
 
@@ -421,10 +509,16 @@ def play_block(driver, extra_practice=False):
         elif remaining > 0:
             mins = remaining // 60
             secs = remaining % 60
-            subtitle = f"{mins}:{secs:02d}"
+            time_suffix = ""
             if extra_practice:
-                subtitle += " <span style='color:#8fb3ff;'>(extra practice)</span>"
-            inject_overlay(driver, OVERLAY_COPY["play_title"], subtitle)
+                time_suffix = " <span style='color:#8fb3ff;'>(extra practice)</span>"
+            inject_overlay(
+                driver,
+                OVERLAY_COPY["play_title"],
+                f"{mins}:{secs:02d}",
+                countdown_seconds=remaining,
+                time_suffix=time_suffix,
+            )
         else:
             inject_overlay(driver, OVERLAY_COPY["play_waiting_title"])
 
@@ -478,7 +572,12 @@ def review_block(driver, game_id, game_data=None):
         mins = remaining // 60
         secs = remaining % 60
 
-        inject_overlay(driver, OVERLAY_COPY["review_title"], f"{mins}:{secs:02d}")
+        inject_overlay(
+            driver,
+            OVERLAY_COPY["review_title"],
+            f"{mins}:{secs:02d}",
+            countdown_seconds=remaining,
+        )
 
         time.sleep(5)
 
@@ -491,6 +590,22 @@ def run():
 
     driver = get_driver()
     extra_practice = False
+
+    if not has_domain_cookie("101weiqi.com"):
+        wait_for_account_setup(
+            driver,
+            TSUMEGO_LOGIN_URL,
+            "101weiqi.com",
+            "Sign in to 101weiqi to continue",
+        )
+
+    if not has_domain_cookie("online-go.com"):
+        wait_for_account_setup(
+            driver,
+            OGS_LOGIN_URL,
+            "online-go.com",
+            "Sign in to OGS to continue",
+        )
 
     while True:
 
